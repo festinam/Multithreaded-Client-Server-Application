@@ -5,6 +5,7 @@
 #include <sys/msg.h>
 #include <pthread.h>
 #include <string.h>
+#include <sys/types.h>
 
 #define SERVER_KEY 1234
 #define CLIENT_KEY 5678
@@ -13,11 +14,14 @@
 typedef struct {
     long mtype;
     char data[256];
+    pid_t pid;
 } Message;
 
 typedef struct {
-    int client_queue_id;
     pthread_t thread;
+    int connected;
+    pid_t client_pid;
+    int client_queue_id;  // Shto fushen client_queue_id per te ruajtur queue ID e klientit
 } ClientInfo;
 
 ClientInfo connected_clients[MAX_CLIENTS];
@@ -28,60 +32,54 @@ void* client_handler(void* arg) {
     Message request, response;
     ssize_t msg_size;
 
-    // Get the client's PID and IPC ID
     pid_t client_pid = getpid();
-    int client_ipc_id = client_queue_id;
 
-    // Display client connection information
-    printf("Klienti i ri i konektuar - PID: %d, IPC ID: %d\n", client_pid, client_ipc_id);
+    ClientInfo client_info;
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (connected_clients[i].thread == pthread_self()) {
+            client_info = connected_clients[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
 
     while ((msg_size = msgrcv(client_queue_id, &request, sizeof(Message) - sizeof(long), CLIENT_KEY, 0)) > 0) {
-        // Process the request
-        printf("msgrcv: %s\n", request.data);
-        printf("Mesazhi nga klienti (PID: %d, IPC ID: %d): %s\n", client_pid, client_ipc_id, request.data);
+        printf("Mesazhi i pranuar nga klienti (PID %d): %s\n", client_info.client_pid, request.data);
 
-        // Check if the client wants to disconnect
         if (strcmp(request.data, "disconnect") == 0) {
-            printf("Klienti u ckyc (PID: %d, IPC ID: %d)\n", client_pid, client_ipc_id);
+            printf("Klienti (PID %d) eshte diskonektuar\n", client_info.client_pid);
             break;
         }
 
-        // Generate the response
         response.mtype = CLIENT_KEY;
-        strcpy(response.data, "Mesazhi nga serveri");
+        strcpy(response.data, "Mesazhi i pranuar nga serveri");
 
-        // Send the response back to the client
         if (msgsnd(client_queue_id, &response, sizeof(Message) - sizeof(long), 0) == -1) {
             perror("msgsnd");
             break;
         }
     }
 
-    // Remove the client from the connected clients list
     pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (connected_clients[i].client_queue_id == client_queue_id) {
-            connected_clients[i].client_queue_id = 0;
+        if (connected_clients[i].thread == pthread_self()) {
+            connected_clients[i].thread = 0;
+            connected_clients[i].connected = 0;
             break;
         }
     }
     pthread_mutex_unlock(&clients_mutex);
 
-    // Display client disconnection information
-    printf("Klienti u ckyc (PID: %d, IPC ID: %d)\n", client_pid, client_ipc_id);
+    msgctl(client_queue_id, IPC_RMID, NULL);  // Fshij message queue te klientit
 
-    // Terminate the thread
     pthread_detach(pthread_self());
     return NULL;
 }
 
-
-
-
 int main() {
     int server_queue_id;
 
-    // Create server message queue
     if ((server_queue_id = msgget(SERVER_KEY, IPC_CREAT | 0666)) == -1) {
         perror("msgget");
         exit(1);
@@ -90,44 +88,39 @@ int main() {
     printf("Serveri eshte duke punuar\n");
 
     while (1) {
-        // Accept connections from clients
         Message connect_msg;
         if (msgrcv(server_queue_id, &connect_msg, sizeof(Message) - sizeof(long), 1, 0) == -1) {
             perror("msgrcv");
             exit(1);
         }
 
-        // Check if the client wants to disconnect
         if (strcmp(connect_msg.data, "disconnect") == 0) {
-            printf("Klienti u diskonektua\n");
+            printf("Klienti (PID %d) eshte diskonektuar\n", connect_msg.pid);
             continue;
         }
 
-        // Create a new client message queue
         int client_queue_id;
-        if ((client_queue_id = msgget(CLIENT_KEY + rand() % 100, IPC_CREAT | 0666)) == -1) {
+        if ((client_queue_id = msgget(CLIENT_KEY, IPC_CREAT | 0666)) == -1) {
             perror("msgget");
             exit(1);
         }
 
-        // Add the client to the connected clients list
         pthread_mutex_lock(&clients_mutex);
         int i;
         for (i = 0; i < MAX_CLIENTS; i++) {
-            if (connected_clients[i].client_queue_id == 0) {
-                connected_clients[i].client_queue_id = client_queue_id;
+            if (!connected_clients[i].connected) {
+                connected_clients[i].connected = 1;
+                connected_clients[i].client_pid = connect_msg.pid;
+                connected_clients[i].client_queue_id = client_queue_id;  // Ruaj queue ID te klientit
                 break;
             }
         }
         pthread_mutex_unlock(&clients_mutex);
 
-        // Spawn a new thread to handle the client
-        pthread_create(&connected_clients[i].thread, NULL, client_handler, &connected_clients[i].client_queue_id);
+        pthread_create(&connected_clients[i].thread, NULL, client_handler, &client_queue_id);
     }
 
-    // Clean up the server message queue
     msgctl(server_queue_id, IPC_RMID, NULL);
 
     return 0;
 }
-
